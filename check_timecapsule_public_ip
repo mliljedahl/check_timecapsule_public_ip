@@ -1,0 +1,150 @@
+#!/usr/bin/perl
+# check_timecapsule_public_ip: Nagios/Icinga check for monitoring public ip 
+# address of Apple Time Capsule.
+#
+# Copyright (C) 2013, Markus Liljedahl <markus@liljedahl.me>
+#
+# Usage: See README.md
+
+use strict;
+use warnings;
+
+use SNMP;
+use Socket;
+use Nagios::Plugin;
+
+my $shortname = "PUBLICIP";
+my $logfile = "/tmp/publicip.log";
+
+my $np = Nagios::Plugin->new( 
+    shortname => $shortname,
+    usage => "Usage: %s [-H] [-C] [-S]",
+);
+
+$np->add_arg(
+    spec => "host|H=s",
+    help => "-H, --host=ip address. The target ip address to monitor",
+    required => 1,
+);
+
+$np->add_arg(
+    spec => "community|C=s",
+    help => "-C, --community=public. SNMP community, defaults to public",
+);
+
+$np->add_arg(
+    spec => "snmpversion|S=s",
+    help => "-S, --snmpversion=2. SNMP version, defaults to version 2c",
+);
+
+$np->getopts;
+
+my $community = "public" || $np->opts->community;
+my $version = 2 || $np->opts->version;
+
+my $activeIp = getActiveIp($np->opts->host, $community, $version);
+my ($message, $status) = checkIpChange($activeIp, $logfile);
+
+$np->nagios_exit( 
+    return_code => $status,
+    message => $message,
+);
+
+# Fetching public ip from Apple Time Capsule by SNMP
+sub getActiveIp
+{
+    my ($host, $community, $version) = @_;
+
+    my $mib  = 'IP-MIB::ipAdEntAddr';
+
+    my $sess; # The SNMP::Session object that does the work.
+    my $ipAddress;  # Holds the public IP address.
+    my $vb;   # The Varbind object used for the 'real' query.
+
+    &SNMP::initMib();
+
+    my %snmpparms;
+    $snmpparms{Community} = $community;
+    $snmpparms{DestHost} = inet_ntoa(inet_aton($host));
+    $snmpparms{Version} = $version;
+    $snmpparms{UseSprintValue} = '1';
+    $sess = new SNMP::Session(%snmpparms);
+
+    # Turn the MIB object into something we can actually use.
+    $vb = new SNMP::Varbind([$mib]);
+
+    # The mib have no index for each interface but the first interface
+    # holds the public IP address. 
+    $ipAddress = $sess->getnext($vb);
+    if ($sess->{ErrorNum}) {
+        code_exit("Got $sess->{ErrorStr} querying $host with community $community for $mib.\n", 2);
+    }
+    return $ipAddress;
+}
+
+# Reads IP from log
+sub openLog
+{
+    my $file = shift;
+
+    open FILE, "<", $file or code_exit("Could not open file: $file\n", 2);
+    my $text = <FILE>;
+    close FILE;
+
+    return $text;
+}
+
+# Writes IP to log
+sub writeLog
+{
+    my ($file, $text) = @_;
+
+    open FILE, ">", $file or code_exit("Could not write to file: $file\n", 2);
+    print FILE $text;
+    close FILE;
+}
+
+# Custom subrutine for exiting with message and status code
+sub code_exit
+{
+    my ($message, $status) = @_;
+
+    if (!$message) { $message = "Unknown error\n"; };
+    if (!$status)  { $status = 3; };
+
+    if ($status == 0) { $message = " OK - " . $message; }
+    elsif ($status == 1) { $message = " WARNING - " . $message; }
+    elsif ($status == 2) { $message = " CRITICAL - " . $message; }
+    else { $message = " UNKNOWN - " . $message; }
+
+    print &shortname . $message;
+    exit $status;
+}
+
+# Compares current IP with IP from log
+sub checkIpChange
+{
+    my ($activeIp, $ipLog) = @_;
+    my $message  = "Can not get ip status";
+    my $status   = 2;
+
+    if (-e $ipLog) {
+        my $currentIp = openLog($ipLog);
+
+        if ($currentIp eq $activeIp) {
+            $message = "No change: $activeIp\n";
+            $status  = 0;
+        } else {
+            writeLog($ipLog, $activeIp);
+            $message = "IP Address has changed: $activeIp -> $currentIp\n";
+            $status  = 2;
+        }
+    } else {
+        writeLog($ipLog, $activeIp);
+        $message = "Nothing to compare with: $activeIp\n";
+        $status  = 1;
+    }
+
+    return ($message, $status);
+}
+
